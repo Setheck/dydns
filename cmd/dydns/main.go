@@ -13,9 +13,10 @@ import (
 )
 
 type environment struct {
-	NamesiloAPIKey string `envconfig:"NAMESILO_API_KEY" required:"true"`
-	NamesiloDomain string `envconfig:"NAMESILO_DOMAIN" required:"true"`
-	NamesiloHost   string `envconfig:"NAMESILO_HOST" required:"true"`
+	NamesiloAPIKey         string        `envconfig:"NAMESILO_API_KEY" required:"true"`
+	NamesiloDomain         string        `envconfig:"NAMESILO_DOMAIN" required:"true"`
+	NamesiloHost           string        `envconfig:"NAMESILO_HOST" required:"true"`
+	NamesiloUpdateInterval time.Duration `envconfig:"NAMESILO_UPDATE_INTERVAL" default:"24h"`
 }
 
 func main() {
@@ -35,7 +36,7 @@ func main() {
 		apiKey:   env.NamesiloAPIKey,
 		domain:   env.NamesiloDomain,
 		host:     env.NamesiloHost,
-		interval: 5 * time.Minute,
+		interval: env.NamesiloUpdateInterval,
 	})
 
 }
