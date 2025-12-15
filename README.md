@@ -1,0 +1,2 @@
+# dydns
+Dynamic DNS Updater
