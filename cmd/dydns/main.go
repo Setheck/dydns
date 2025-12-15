@@ -3,12 +3,13 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
+	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
 	"github.com/kelseyhightower/envconfig"
+	"github.com/rs/zerolog"
 	"github.com/setheck/dydns/pkg/namesilo"
 )
 
@@ -19,18 +20,24 @@ type environment struct {
 	NamesiloUpdateInterval time.Duration `envconfig:"NAMESILO_UPDATE_INTERVAL" default:"24h"`
 }
 
+var log = zerolog.New(zerolog.ConsoleWriter{
+	Out:        os.Stdout,
+	TimeFormat: time.RFC3339}).With().Timestamp().Logger()
+
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	env := &environment{}
 	if err := envconfig.Process("", env); err != nil {
-		log.Fatal(err)
+		log.Fatal().Err(err).Msg("failed to process environment")
 	}
 
-	log.Println("DYDNS starting up.")
-	log.Println("HOST:", env.NamesiloHost)
-	log.Println("DOMAIN:", env.NamesiloDomain)
+	log.Info().Msg("DYDNS")
+	log.Info().Str("HOST", env.NamesiloHost).
+		Str("DOMAIN", env.NamesiloDomain).
+		Str("UPDATE_INTERVAL", env.NamesiloUpdateInterval.String()).
+		Msg("starting up")
 
 	updateOnInterval(ctx, updateConfig{
 		apiKey:   env.NamesiloAPIKey,
@@ -38,7 +45,6 @@ func main() {
 		host:     env.NamesiloHost,
 		interval: env.NamesiloUpdateInterval,
 	})
-
 }
 
 type updateConfig struct {
@@ -51,9 +57,11 @@ type updateConfig struct {
 func updateOnInterval(ctx context.Context, cfg updateConfig) {
 	client := namesilo.New(cfg.apiKey)
 	for {
+
+		log.Info().Msg("-- updating dynamic DNS --")
 		updateCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		if err := updateDynamicDNS(updateCtx, client, cfg); err != nil {
-			log.Println("failed", err)
+			log.Error().Err(err).Msg("failed")
 		}
 		cancel()
 
@@ -66,7 +74,6 @@ func updateOnInterval(ctx context.Context, cfg updateConfig) {
 }
 
 func updateDynamicDNS(ctx context.Context, client *namesilo.Client, cfg updateConfig) error {
-	log.Println("updating dynamic DNS")
 	publicIP, err := namesilo.PublicIPCheck()
 	if err != nil {
 		return fmt.Errorf("failed to get public IP: %w", err)
@@ -102,9 +109,8 @@ func updateDynamicDNS(ctx context.Context, client *namesilo.Client, cfg updateCo
 	if err != nil {
 		return fmt.Errorf("failed to update dns record: %w", err)
 	}
-
-	log.Println("Update Successful")
-	log.Println("Code:", resp.Reply.Code)
-	log.Println("Detail:", resp.Reply.Detail)
+	if resp.Reply.Code != 300 {
+		return fmt.Errorf("invalid code: %d - details: %s", resp.Reply.Code, resp.Reply.Detail)
+	}
 	return nil
 }
