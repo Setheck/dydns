@@ -14,6 +14,7 @@ RUN cp /build/bin/dydns ./dydns
 
 FROM alpine
 
+RUN apk add --no-cache tzdata
 ENV TZ="America/Los_Angeles"
 RUN mkdir -p /app /data
 
