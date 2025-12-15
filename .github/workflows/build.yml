@@ -1,4 +1,4 @@
-name: Release
+name: build
 on:
   pull_request:
     branches:
@@ -15,7 +15,7 @@ env:
   PROJECT_DESCRIPTION: dynamic dns helper
 
 jobs:
-  release:
+  build:
     runs-on: ubuntu-latest
     permissions:
       contents: read
