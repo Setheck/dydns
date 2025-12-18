@@ -28,7 +28,7 @@ type ResourceRecord struct {
 	Type     string `json:"type"`
 	Host     string `json:"host"`
 	Value    string `json:"value"`
-	TTL      string `json:"ttl"`
+	TTL      int    `json:"ttl"`
 	Distance any    `json:"distance"` // distance seems to be string or int
 }
 
