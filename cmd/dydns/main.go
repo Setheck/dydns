@@ -89,9 +89,9 @@ func updateDynamicDNS(ctx context.Context, client *namesilo.Client, cfg updateCo
 	}
 
 	recordID := ""
-	targetFqdnHost := fmt.Sprintf("%s.%s", cfg.host, cfg.domain)
+	targetFqdnHost := fmt.Sprintf("%s", cfg.host)
 	for _, rec := range list.Reply.ResourceRecords {
-		if rec.Host == targetFqdnHost {
+		if rec.Type == "A" && rec.Host == cfg.host {
 			recordID = rec.RecordID
 		}
 	}
