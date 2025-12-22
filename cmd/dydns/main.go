@@ -78,6 +78,7 @@ func updateDynamicDNS(ctx context.Context, client *namesilo.Client, cfg updateCo
 	if err != nil {
 		return fmt.Errorf("failed to get public IP: %w", err)
 	}
+	log.Info().Msgf("public IP: %s", publicIP)
 
 	list, err := client.DnsListRecords(ctx, namesilo.DnsListRecordsParameters{Domain: cfg.domain})
 	if err != nil {
@@ -88,20 +89,25 @@ func updateDynamicDNS(ctx context.Context, client *namesilo.Client, cfg updateCo
 		return fmt.Errorf("invalid code: %d", list.Reply.Code)
 	}
 
-	recordID := ""
+	var existingRecord namesilo.ResourceRecord
 	targetFqdnHost := fmt.Sprintf("%s", cfg.host)
 	for _, rec := range list.Reply.ResourceRecords {
 		if rec.Type == "A" && rec.Host == cfg.host {
-			recordID = rec.RecordID
+			existingRecord = rec
 		}
+
 	}
-	if recordID == "" {
-		return fmt.Errorf("failed to find fqdn: %s, record_id: %s", targetFqdnHost, recordID)
+	if existingRecord.RecordID == "" {
+		return fmt.Errorf("failed to find fqdn: %s, record_id: %s", targetFqdnHost, existingRecord.RecordID)
+	}
+	if existingRecord.Value == publicIP.String() {
+		log.Info().Msgf("record %s is up to date, skipping update", targetFqdnHost)
+		return nil
 	}
 
 	resp, err := client.DnsUpdateRecord(ctx, namesilo.DnsUpdateRecordParameters{
 		Domain:  cfg.domain,
-		RRID:    recordID,
+		RRID:    existingRecord.RecordID,
 		RRHost:  cfg.host,
 		RRValue: publicIP.String(),
 		RRTTL:   "7207",
