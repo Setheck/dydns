@@ -1,15 +1,31 @@
 package namesilo
 
 import (
+	"context"
+	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
-	"net/url"
+	"strings"
+	"time"
+
+	"github.com/google/go-querystring/query"
 )
 
 const (
-	nameSiloHost = "www.namesilo.com"
-	apiBase      = "api"
+	// DefaultBaseURL is the NameSilo API root, including the version-less /api path.
+	DefaultBaseURL = "https://www.namesilo.com/api"
+	// DefaultPublicIPURL returns the caller's public IP as a bare string body.
+	DefaultPublicIPURL = "https://ifconfig.me/ip"
+
+	defaultTimeout = 15 * time.Second
+
+	// maxErrorBodySnippet bounds how much of an unexpected response body ends up
+	// in an error message.
+	maxErrorBodySnippet = 256
+	// maxPublicIPBody is generous for an IPv6 address plus a trailing newline.
+	maxPublicIPBody = 64
 )
 
 type Request struct {
@@ -34,42 +50,121 @@ type ResourceRecord struct {
 
 type Client struct {
 	httpClient *http.Client
+	baseURL    string
 
 	apiKey string
 }
 
-func New(apiKey string) *Client {
-	return &Client{
-		httpClient: http.DefaultClient,
+// Option customizes a Client.
+type Option func(*Client)
+
+// WithHTTPClient replaces the default client, e.g. to share an instrumented transport.
+func WithHTTPClient(hc *http.Client) Option {
+	return func(c *Client) {
+		if hc != nil {
+			c.httpClient = hc
+		}
+	}
+}
+
+// WithBaseURL points the client at an alternate API root, mainly for tests.
+func WithBaseURL(u string) Option {
+	return func(c *Client) {
+		if u != "" {
+			c.baseURL = strings.TrimSuffix(u, "/")
+		}
+	}
+}
+
+func New(apiKey string, opts ...Option) *Client {
+	c := &Client{
+		httpClient: &http.Client{Timeout: defaultTimeout},
+		baseURL:    DefaultBaseURL,
 		apiKey:     apiKey,
 	}
+	for _, opt := range opts {
+		opt(c)
+	}
+	return c
 }
 
-func (c *Client) baseParams() map[string]string {
-	return map[string]string{
-		"version": "1",
-		"type":    "json",
-		"key":     c.apiKey,
+// get issues an API call and decodes the JSON response into out. params is
+// encoded via its `url` struct tags.
+func (c *Client) get(ctx context.Context, operation string, params, out any) error {
+	values, err := query.Values(params)
+	if err != nil {
+		return fmt.Errorf("%s: encode parameters: %w", operation, err)
 	}
+	values.Set("version", "1")
+	values.Set("type", "json")
+	values.Set("key", c.apiKey)
+
+	u := c.baseURL + "/" + operation + "?" + values.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return fmt.Errorf("%s: build request: %w", operation, err)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("%s: %w", operation, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("%s: unexpected HTTP status code: %d: %s",
+			operation, resp.StatusCode, bodySnippet(resp.Body))
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+		return fmt.Errorf("%s: decode response: %w", operation, err)
+	}
+	return nil
 }
 
-func PublicIPCheck() (net.IP, error) {
-	u := &url.URL{
-		Scheme: "https",
-		Host:   "ifconfig.me",
-		Path:   "ip",
+func bodySnippet(r io.Reader) string {
+	b, err := io.ReadAll(io.LimitReader(r, maxErrorBodySnippet))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
+// PublicIPCheck resolves the caller's public IP. A nil hc falls back to a client
+// with a default timeout; an empty rawURL falls back to DefaultPublicIPURL.
+func PublicIPCheck(ctx context.Context, hc *http.Client, rawURL string) (net.IP, error) {
+	if hc == nil {
+		hc = &http.Client{Timeout: defaultTimeout}
+	}
+	if rawURL == "" {
+		rawURL = DefaultPublicIPURL
 	}
 
-	resp, err := http.Get(u.String())
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("build request: %w", err)
+	}
+
+	resp, err := hc.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 
-	raw, err := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected HTTP status code: %d: %s",
+			resp.StatusCode, bodySnippet(resp.Body))
+	}
+
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxPublicIPBody))
 	if err != nil {
 		return nil, err
 	}
 
-	return net.ParseIP(string(raw)), nil
+	body := strings.TrimSpace(string(raw))
+	ip := net.ParseIP(body)
+	if ip == nil {
+		return nil, fmt.Errorf("unparsable public IP response: %q", body)
+	}
+	return ip, nil
 }

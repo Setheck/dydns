@@ -2,9 +2,14 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -13,16 +18,62 @@ import (
 	"github.com/setheck/dydns/pkg/namesilo"
 )
 
+const (
+	recordTypeA = "A"
+
+	resultSuccess = "success"
+	resultError   = "error"
+
+	operationListRecords  = namesilo.OperationDnsListRecords
+	operationUpdateRecord = namesilo.OperationDnsUpdateRecord
+
+	shutdownTimeout = 5 * time.Second
+)
+
 type environment struct {
 	NamesiloAPIKey         string        `envconfig:"NAMESILO_API_KEY" required:"true"`
 	NamesiloDomain         string        `envconfig:"NAMESILO_DOMAIN" required:"true"`
 	NamesiloHost           string        `envconfig:"NAMESILO_HOST" required:"true"`
 	NamesiloUpdateInterval time.Duration `envconfig:"NAMESILO_UPDATE_INTERVAL" default:"24h"`
+	NamesiloUpdateTimeout  time.Duration `envconfig:"NAMESILO_UPDATE_TIMEOUT" default:"30s"`
+	NamesiloRecordTTL      int           `envconfig:"NAMESILO_RECORD_TTL" default:"7207"`
+	NamesiloBaseURL        string        `envconfig:"NAMESILO_BASE_URL" default:"https://www.namesilo.com/api"`
+	MetricsPort            int           `envconfig:"DYDNS_METRICS_PORT" default:"8080"`
+	PublicIPURL            string        `envconfig:"PUBLIC_IP_URL" default:"https://ifconfig.me/ip"`
+	LogLevel               string        `envconfig:"LOG_LEVEL" default:"info"`
+	LogFormat              string        `envconfig:"LOG_FORMAT" default:"auto"`
 }
 
-var log = zerolog.New(zerolog.ConsoleWriter{
-	Out:        os.Stdout,
-	TimeFormat: time.RFC3339}).With().Timestamp().Logger()
+var log = newLogger("auto", "info")
+
+// newLogger builds the logger. format is "auto", "json" or "console"; "auto"
+// uses the human-readable console writer only when stdout is a terminal, so
+// container logs stay machine-parseable.
+func newLogger(format, level string) zerolog.Logger {
+	var w io.Writer = os.Stdout
+	if format == "console" || (format != "json" && isTerminal(os.Stdout)) {
+		w = zerolog.ConsoleWriter{Out: os.Stdout, TimeFormat: time.RFC3339}
+	}
+
+	lvl, err := zerolog.ParseLevel(level)
+	if err != nil || lvl == zerolog.NoLevel {
+		lvl = zerolog.InfoLevel
+	}
+
+	return zerolog.New(w).Level(lvl).With().Timestamp().Logger()
+}
+
+// isTerminal reports whether f is a character device. Pipes and regular files
+// are not, which is the case that matters here: it keeps container logs as
+// JSON. Character devices other than a tty (/dev/null) also report true, so set
+// LOG_FORMAT explicitly if that distinction matters.
+func isTerminal(f *os.File) bool {
+	fi, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return fi.Mode()&os.ModeCharDevice != 0
+}
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -32,42 +83,110 @@ func main() {
 	if err := envconfig.Process("", env); err != nil {
 		log.Fatal().Err(err).Msg("failed to process environment")
 	}
+	log = newLogger(env.LogFormat, env.LogLevel)
 
-	log.Info().Msg("DYDNS")
-	log.Info().Str("HOST", env.NamesiloHost).
-		Str("DOMAIN", env.NamesiloDomain).
-		Str("UPDATE_INTERVAL", env.NamesiloUpdateInterval.String()).
-		Msg("starting up")
+	version, commit := buildVersion()
+	log.Info().
+		Str("version", version).
+		Str("commit", commit).
+		Str("domain", env.NamesiloDomain).
+		Str("host", env.NamesiloHost).
+		Str("base_url", env.NamesiloBaseURL).
+		Str("update_interval", env.NamesiloUpdateInterval.String()).
+		Str("update_timeout", env.NamesiloUpdateTimeout.String()).
+		Int("record_ttl", env.NamesiloRecordTTL).
+		Msg("starting dydns")
 
-	StartMetricsServer()
-	updateOnInterval(ctx, updateConfig{
-		apiKey:   env.NamesiloAPIKey,
-		domain:   env.NamesiloDomain,
-		host:     env.NamesiloHost,
-		interval: env.NamesiloUpdateInterval,
-	})
+	initMetrics(version, commit, env.NamesiloDomain, env.NamesiloHost)
+
+	ready := &readiness{}
+	srv := startMetricsServer(fmt.Sprintf(":%d", env.MetricsPort), ready)
+
+	// One client for both NameSilo and the public IP lookup. The per-request
+	// context carries the real deadline; the timeout here is a backstop.
+	httpClient := &http.Client{Timeout: env.NamesiloUpdateTimeout}
+	client := namesilo.New(env.NamesiloAPIKey,
+		namesilo.WithHTTPClient(httpClient),
+		namesilo.WithBaseURL(env.NamesiloBaseURL))
+
+	updateOnInterval(ctx, client, updateConfig{
+		domain:      env.NamesiloDomain,
+		host:        env.NamesiloHost,
+		interval:    env.NamesiloUpdateInterval,
+		timeout:     env.NamesiloUpdateTimeout,
+		ttl:         env.NamesiloRecordTTL,
+		publicIPURL: env.PublicIPURL,
+		httpClient:  httpClient,
+	}, ready)
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Error().Err(err).Msg("metrics server shutdown failed")
+	}
+	log.Info().Msg("shutdown complete")
 }
 
 type updateConfig struct {
-	apiKey   string
-	domain   string
-	host     string
-	interval time.Duration
+	domain      string
+	host        string
+	interval    time.Duration
+	timeout     time.Duration
+	ttl         int
+	publicIPURL string
+	httpClient  *http.Client
 }
 
-func updateOnInterval(ctx context.Context, cfg updateConfig) {
-	client := namesilo.New(cfg.apiKey)
-	for {
+// stageError tags a failure with the update-cycle stage that produced it, so
+// the loop can attribute it to a metric label in one place.
+type stageError struct {
+	stage string
+	err   error
+}
 
-		log.Info().Msg("-- updating dynamic DNS --")
-		updateCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		if err := updateDynamicDNS(updateCtx, client, cfg); err != nil {
-			log.Error().Err(err).Msg("failed")
-		}
+func (e *stageError) Error() string { return e.err.Error() }
+func (e *stageError) Unwrap() error { return e.err }
+
+func stageErrf(stage, format string, a ...any) error {
+	return &stageError{stage: stage, err: fmt.Errorf(format, a...)}
+}
+
+func updateOnInterval(ctx context.Context, client *namesilo.Client, cfg updateConfig, ready *readiness) {
+	for {
+		log.Info().Msg("updating dynamic DNS")
+
+		start := time.Now()
+		updateCtx, cancel := context.WithTimeout(ctx, cfg.timeout)
+		err := updateDynamicDNS(updateCtx, client, cfg)
 		cancel()
+
+		updateCyclesTotal.Inc()
+		updateCycleDuration.Observe(time.Since(start).Seconds())
+
+		switch {
+		case err == nil:
+			now := time.Now()
+			lastSuccessTimestamp.Set(float64(now.Unix()))
+			consecutiveFailures.Set(0)
+			ready.markSuccess(now)
+		case ctx.Err() != nil:
+			// The parent context was cancelled: this is a shutdown, not a
+			// failure, so it must not count against the error metrics.
+			log.Info().Msg("update interrupted by shutdown")
+		default:
+			consecutiveFailures.Inc()
+			event := log.Error().Err(err)
+			var se *stageError
+			if errors.As(err, &se) {
+				updateCycleErrorsTotal.WithLabelValues(se.stage).Inc()
+				event = event.Str("stage", se.stage)
+			}
+			event.Msg("update cycle failed")
+		}
 
 		select {
 		case <-ctx.Done():
+			log.Info().Msg("shutting down")
 			return
 		case <-time.After(cfg.interval):
 		}
@@ -75,54 +194,132 @@ func updateOnInterval(ctx context.Context, cfg updateConfig) {
 }
 
 func updateDynamicDNS(ctx context.Context, client *namesilo.Client, cfg updateConfig) error {
-	publicIP, err := namesilo.PublicIPCheck()
+	publicIP, err := checkPublicIP(ctx, cfg)
 	if err != nil {
-		return fmt.Errorf("failed to get public IP: %w", err)
+		return stageErrf(stagePublicIP, "failed to get public IP: %w", err)
 	}
-	log.Info().Msgf("public IP: %s", publicIP)
+	log.Info().Str("public_ip", publicIP.String()).Msg("resolved public IP")
 
-	dnsNamesiloInfo.WithLabelValues(cfg.domain, cfg.host, publicIP.String()).Set(1)
-	dnsNamesiloListRecordsTotal.Inc()
-	list, err := client.DnsListRecords(ctx, namesilo.DnsListRecordsParameters{Domain: cfg.domain})
+	// Reset first: without it every observed IP keeps its own series at 1
+	// forever, so several IPs would report as current at once.
+	publicIPInfo.Reset()
+	publicIPInfo.WithLabelValues(publicIP.String()).Set(1)
+
+	list, err := listRecords(ctx, client, cfg)
 	if err != nil {
-		dnsNamesiloListRecordsErrorsTotal.Inc()
-		return fmt.Errorf("failed to list records: %w", err)
+		return stageErrf(stageListRecords, "failed to list records: %w", err)
+	}
+	if list.Reply.Code != namesilo.ReplyCodeSuccess {
+		return stageErrf(stageListRecordsReply, "%s returned code %d: %s",
+			operationListRecords, list.Reply.Code, list.Reply.Detail)
 	}
 
-	if list.Reply.Code != 300 {
-		return fmt.Errorf("invalid code: %d", list.Reply.Code)
+	existing, matches := findARecord(list.Reply.ResourceRecords, cfg.host)
+	if matches > 1 {
+		log.Warn().Str("host", cfg.host).Int("matches", matches).
+			Msg("multiple A records matched, using the last")
+	}
+	if existing.RecordID == "" {
+		recordUpToDate.Set(0)
+		return stageErrf(stageRecordNotFound, "no %s record found for host %q in domain %q",
+			recordTypeA, cfg.host, cfg.domain)
 	}
 
-	var existingRecord namesilo.ResourceRecord
-	targetFqdnHost := fmt.Sprintf("%s", cfg.host)
-	for _, rec := range list.Reply.ResourceRecords {
-		if rec.Type == "A" && rec.Host == cfg.host {
-			existingRecord = rec
-		}
-
-	}
-	if existingRecord.RecordID == "" {
-		return fmt.Errorf("failed to find fqdn: %s, record_id: %s", targetFqdnHost, existingRecord.RecordID)
-	}
-	if existingRecord.Value == publicIP.String() {
-		log.Info().Msgf("record %s is up to date, skipping update", targetFqdnHost)
+	if existing.Value == publicIP.String() {
+		recordUpToDate.Set(1)
+		log.Info().Str("host", cfg.host).Str("value", existing.Value).
+			Msg("record is up to date, skipping update")
 		return nil
 	}
 
-	dnsNamesiloUpdatesTotal.Inc()
+	log.Info().Str("host", cfg.host).Str("from", existing.Value).Str("to", publicIP.String()).
+		Msg("updating record")
+
+	resp, err := updateRecord(ctx, client, cfg, existing.RecordID, publicIP.String())
+	if err != nil {
+		recordUpToDate.Set(0)
+		return stageErrf(stageUpdateRecord, "failed to update dns record: %w", err)
+	}
+	if resp.Reply.Code != namesilo.ReplyCodeSuccess {
+		recordUpToDate.Set(0)
+		return stageErrf(stageUpdateRecordReply, "%s returned code %d: %s",
+			operationUpdateRecord, resp.Reply.Code, resp.Reply.Detail)
+	}
+
+	recordUpToDate.Set(1)
+	recordChangesTotal.Inc()
+	lastChangeTimestamp.SetToCurrentTime()
+	log.Info().Str("host", cfg.host).Str("value", publicIP.String()).Msg("record updated")
+	return nil
+}
+
+// findARecord returns the last A record matching host, and how many matched.
+func findARecord(records []namesilo.ResourceRecord, host string) (namesilo.ResourceRecord, int) {
+	var found namesilo.ResourceRecord
+	var matches int
+	for _, rec := range records {
+		if rec.Type == recordTypeA && rec.Host == host {
+			found = rec
+			matches++
+		}
+	}
+	return found, matches
+}
+
+func checkPublicIP(ctx context.Context, cfg updateConfig) (net.IP, error) {
+	start := time.Now()
+	ip, err := namesilo.PublicIPCheck(ctx, cfg.httpClient, cfg.publicIPURL)
+	publicIPCheckDuration.Observe(time.Since(start).Seconds())
+	if err != nil {
+		publicIPChecksTotal.WithLabelValues(resultError).Inc()
+		return nil, err
+	}
+	publicIPChecksTotal.WithLabelValues(resultSuccess).Inc()
+	return ip, nil
+}
+
+func listRecords(ctx context.Context, client *namesilo.Client, cfg updateConfig) (*namesilo.DnsListRecordsResponse, error) {
+	start := time.Now()
+	resp, err := client.DnsListRecords(ctx, namesilo.DnsListRecordsParameters{Domain: cfg.domain})
+	code := 0
+	if resp != nil {
+		code = resp.Reply.Code
+	}
+	observeNamesilo(operationListRecords, start, code, err)
+	if err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+func updateRecord(ctx context.Context, client *namesilo.Client, cfg updateConfig, recordID, value string) (*namesilo.DnsUpdateRecordResponse, error) {
+	start := time.Now()
 	resp, err := client.DnsUpdateRecord(ctx, namesilo.DnsUpdateRecordParameters{
 		Domain:  cfg.domain,
-		RRID:    existingRecord.RecordID,
+		RRID:    recordID,
 		RRHost:  cfg.host,
-		RRValue: publicIP.String(),
-		RRTTL:   "7207",
+		RRValue: value,
+		RRTTL:   strconv.Itoa(cfg.ttl),
 	})
+	code := 0
+	if resp != nil {
+		code = resp.Reply.Code
+	}
+	observeNamesilo(operationUpdateRecord, start, code, err)
 	if err != nil {
-		dnsNamesiloListRecordsErrorsTotal.Inc()
-		return fmt.Errorf("failed to update dns record: %w", err)
+		return nil, err
 	}
-	if resp.Reply.Code != 300 {
-		return fmt.Errorf("invalid code: %d - details: %s", resp.Reply.Code, resp.Reply.Detail)
+	return resp, nil
+}
+
+// observeNamesilo records the duration and outcome of an API call. Calls that
+// never produced a reply code are labelled "error" rather than a bogus 0.
+func observeNamesilo(operation string, start time.Time, code int, err error) {
+	namesiloRequestDuration.WithLabelValues(operation).Observe(time.Since(start).Seconds())
+
+	replyCode := resultError
+	if err == nil {
+		replyCode = strconv.Itoa(code)
 	}
-	return nil
+	namesiloRequestsTotal.WithLabelValues(operation, replyCode).Inc()
 }
