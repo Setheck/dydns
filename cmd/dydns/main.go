@@ -106,6 +106,7 @@ func updateDynamicDNS(ctx context.Context, client *namesilo.Client, cfg updateCo
 		return nil
 	}
 
+	dnsUpdatesTotal.Inc()
 	resp, err := client.DnsUpdateRecord(ctx, namesilo.DnsUpdateRecordParameters{
 		Domain:  cfg.domain,
 		RRID:    existingRecord.RecordID,
@@ -114,6 +115,7 @@ func updateDynamicDNS(ctx context.Context, client *namesilo.Client, cfg updateCo
 		RRTTL:   "7207",
 	})
 	if err != nil {
+		dnsUpdateErrorsTotal.Inc()
 		return fmt.Errorf("failed to update dns record: %w", err)
 	}
 	if resp.Reply.Code != 300 {

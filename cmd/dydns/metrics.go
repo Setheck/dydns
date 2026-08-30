@@ -23,7 +23,7 @@ var (
 
 func StartMetricsServer() {
 	go func() {
-		port := os.Getenv("DYDNS_PORT")
+		port := os.Getenv("DYDNS_METRICS_PORT")
 		if port == "" {
 			port = "8080"
 		}
