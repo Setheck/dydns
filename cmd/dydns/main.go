@@ -39,6 +39,7 @@ func main() {
 		Str("UPDATE_INTERVAL", env.NamesiloUpdateInterval.String()).
 		Msg("starting up")
 
+	StartMetricsServer()
 	updateOnInterval(ctx, updateConfig{
 		apiKey:   env.NamesiloAPIKey,
 		domain:   env.NamesiloDomain,
