@@ -12,12 +12,14 @@ import (
 var (
 	namespace       = "dydns"
 	dnsUpdatesTotal = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "dns_updates_total",
-		Help: "Total number of DNS updates.",
+		Namespace: namespace,
+		Name:      "dns_updates_total",
+		Help:      "Total number of DNS updates.",
 	})
 	dnsUpdateErrorsTotal = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "dns_update_errors_total",
-		Help: "Total number of DNS update errors.",
+		Namespace: namespace,
+		Name:      "dns_update_errors_total",
+		Help:      "Total number of DNS update errors.",
 	})
 )
 
