@@ -11,15 +11,30 @@ import (
 
 var (
 	namespace       = "dydns"
-	dnsUpdatesTotal = promauto.NewCounter(prometheus.CounterOpts{
+	dnsNamesiloInfo = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: namespace,
-		Name:      "dns_updates_total",
+		Name:      "dns_namesilo_info",
+		Help:      "Information about registered namesilo dns, always 1.",
+	}, []string{"domain", "host", "public_ip"})
+	dnsNamesiloUpdatesTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: namespace,
+		Name:      "dns_namesilo_updates_total",
 		Help:      "Total number of DNS updates.",
 	})
-	dnsUpdateErrorsTotal = promauto.NewCounter(prometheus.CounterOpts{
+	dnsNamesiloUpdateErrorsTotal = promauto.NewCounter(prometheus.CounterOpts{
 		Namespace: namespace,
-		Name:      "dns_update_errors_total",
+		Name:      "dns_namesilo_update_errors_total",
 		Help:      "Total number of DNS update errors.",
+	})
+	dnsNamesiloListRecordsTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: namespace,
+		Name:      "dns_namesilo_list_records_total",
+		Help:      "Total number of DNS records listed by Namesilo.",
+	})
+	dnsNamesiloListRecordsErrorsTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: namespace,
+		Name:      "dns_namesilo_list_records_errors_total",
+		Help:      "Total number of DNS record listing errors.",
 	})
 )
 

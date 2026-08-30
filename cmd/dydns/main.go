@@ -81,8 +81,11 @@ func updateDynamicDNS(ctx context.Context, client *namesilo.Client, cfg updateCo
 	}
 	log.Info().Msgf("public IP: %s", publicIP)
 
+	dnsNamesiloInfo.WithLabelValues(cfg.domain, cfg.host, publicIP.String()).Set(1)
+	dnsNamesiloListRecordsTotal.Inc()
 	list, err := client.DnsListRecords(ctx, namesilo.DnsListRecordsParameters{Domain: cfg.domain})
 	if err != nil {
+		dnsNamesiloListRecordsErrorsTotal.Inc()
 		return fmt.Errorf("failed to list records: %w", err)
 	}
 
@@ -106,7 +109,7 @@ func updateDynamicDNS(ctx context.Context, client *namesilo.Client, cfg updateCo
 		return nil
 	}
 
-	dnsUpdatesTotal.Inc()
+	dnsNamesiloUpdatesTotal.Inc()
 	resp, err := client.DnsUpdateRecord(ctx, namesilo.DnsUpdateRecordParameters{
 		Domain:  cfg.domain,
 		RRID:    existingRecord.RecordID,
@@ -115,7 +118,7 @@ func updateDynamicDNS(ctx context.Context, client *namesilo.Client, cfg updateCo
 		RRTTL:   "7207",
 	})
 	if err != nil {
-		dnsUpdateErrorsTotal.Inc()
+		dnsNamesiloListRecordsErrorsTotal.Inc()
 		return fmt.Errorf("failed to update dns record: %w", err)
 	}
 	if resp.Reply.Code != 300 {
